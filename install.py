@@ -2,11 +2,14 @@
 """Install and enroll the Sigvid agent on an Ubuntu/Debian server.
 
 Standard library only. The .deb package is what gets installed, upgraded and
-removed; this script fetches it, verifies it, installs it, writes the backend
-address, enrolls the host and starts the services.
+removed; this script fetches it from the public GitHub release (pinned with
+--version, otherwise the latest release), verifies it against the release's
+SHA256SUMS, installs it, writes the backend address, enrolls the host and
+starts the services.
 
-  sudo python3 install.py --server https://sigvid.example --token enr_...
-  sudo python3 install.py --server http://192.168.122.1:8080 --token enr_... --allow-insecure-http --deb ./sigvid-agent_0.1.0_amd64.deb
+  sudo python3 install.py --server https://sigvid.example --token enr_... --version 0.1.2
+  sudo python3 install.py --server http://127.0.0.1:18080 --token enr_... --allow-insecure-http --from http://127.0.0.1:18080/downloads
+  sudo python3 install.py --server https://sigvid.example --token enr_... --deb ./sigvid-agent_0.1.2_amd64.deb
 """
 import argparse
 import hashlib
@@ -18,10 +21,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 DEFAULT_REPO = "norvidinc/sigvid-agentic-defense-v6-alpha-install"
-DEFAULT_API = "https://api.github.com"
 CONFIG = "/etc/sigvid/agent.yaml"
 # Components a release may carry; the package name decides which asset to fetch.
 COMPONENTS = {"host-agent": "sigvid-agent"}
@@ -44,16 +47,19 @@ def run(cmd, check=True, capture=False):
     return r
 
 
-def fetch(url, dest, headers=None):
-    req = urllib.request.Request(url, headers=headers or {"User-Agent": "sigvid-install.py"})
-    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
-        shutil.copyfileobj(resp, out)
+class FetchError(Exception):
+    pass
 
 
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "sigvid-install.py", "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp)
+def fetch(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "sigvid-install.py"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+            shutil.copyfileobj(resp, out)
+    except urllib.error.HTTPError as e:
+        raise FetchError("%s -> HTTP %d" % (url, e.code))
+    except (urllib.error.URLError, OSError) as e:
+        raise FetchError("%s -> %s" % (url, getattr(e, "reason", e)))
 
 
 def sha256(path):
@@ -84,33 +90,17 @@ def preflight(args):
 _COMPONENT = "host-agent"
 
 
-def component_of(_base):
-    return _COMPONENT
-
-
-def obtain_from_backend(base, tmp):
-    """Fetch SHA256SUMS and the package it names from a Sigvid backend."""
-    base = base.rstrip("/")
-    sums_path = os.path.join(tmp, "SHA256SUMS")
-    log("Fetching package list from " + base)
-    fetch(base + "/SHA256SUMS", sums_path)
-    deb_name = expected = None
-    with open(sums_path) as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) == 2 and parts[1].lstrip("*").startswith(COMPONENTS[component_of(base)] + "_") and parts[1].endswith(".deb"):
-                expected, deb_name = parts[0], parts[1].lstrip("*")
-                break
-    if not deb_name:
-        die("the checksum file lists no package for this component")
-    deb_path = os.path.join(tmp, deb_name)
-    log("Downloading " + deb_name + " ...")
-    fetch(base + "/" + deb_name, deb_path)
-    actual = sha256(deb_path)
-    if actual != expected:
-        die("checksum mismatch for %s: expected %s, got %s" % (deb_name, expected, actual))
-    log("Verified SHA-256 against the backend's checksum file ... ok")
-    return deb_path
+def release_base(args):
+    """Where SHA256SUMS and the package come from: a backend's /downloads
+    (--from), an explicit URL (--release-url, used by tests), or the GitHub
+    release selected by --version. Returns the base URL and its kind."""
+    if args.from_url:
+        return args.from_url.rstrip("/"), "backend"
+    if args.release_url:
+        return args.release_url.rstrip("/"), "release"
+    if args.version == "latest":
+        return "https://github.com/%s/releases/latest/download" % args.repo, "release"
+    return "https://github.com/%s/releases/download/v%s" % (args.repo, args.version.lstrip("v")), "release"
 
 
 def obtain_deb(args, tmp):
@@ -119,35 +109,33 @@ def obtain_deb(args, tmp):
             die("no such file: " + args.deb)
         log("Using local package " + args.deb)
         return args.deb
-    if getattr(args, "from_url", None):
-        return obtain_from_backend(args.from_url, tmp)
-    api = "%s/repos/%s/releases/%s" % (args.api_base.rstrip("/"), args.repo, "latest" if args.version == "latest" else "tags/v" + args.version.lstrip("v"))
-    log("Looking up release from " + api)
-    rel = fetch_json(api)
-    assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
-    tag = rel.get("tag_name", "").lstrip("v")
-    deb_name = "%s_%s_amd64.deb" % (COMPONENTS[args.component], tag)
-    if deb_name not in assets:
-        die("release %s has no asset %s (assets: %s)" % (rel.get("tag_name"), deb_name, ", ".join(sorted(assets)) or "none"))
-    if "SHA256SUMS" not in assets:
-        die("release %s has no SHA256SUMS asset; refusing to install an unverified package" % rel.get("tag_name"))
-    deb_path = os.path.join(tmp, deb_name)
+    base, kind = release_base(args)
+    log("Release source: " + base)
     sums_path = os.path.join(tmp, "SHA256SUMS")
-    log("Downloading " + deb_name + " ...")
-    fetch(assets[deb_name], deb_path)
-    fetch(assets["SHA256SUMS"], sums_path)
-    expected = None
+    try:
+        fetch(base + "/SHA256SUMS", sums_path)
+    except FetchError as e:
+        die("no SHA256SUMS at this %s (%s); refusing to install an unverified package" % (kind, e))
+    want = COMPONENTS[_COMPONENT] + "_"
+    deb_name = expected = None
     with open(sums_path) as f:
         for line in f:
             parts = line.split()
-            if len(parts) == 2 and parts[1].lstrip("*") == deb_name:
-                expected = parts[0]
-    if not expected:
-        die("SHA256SUMS does not list " + deb_name)
+            if len(parts) == 2 and parts[1].lstrip("*").startswith(want) and parts[1].endswith(".deb"):
+                expected, deb_name = parts[0], parts[1].lstrip("*")
+                break
+    if not deb_name:
+        die("SHA256SUMS lists no package for component " + _COMPONENT)
+    deb_path = os.path.join(tmp, deb_name)
+    log("Downloading " + deb_name + " ...")
+    try:
+        fetch(base + "/" + deb_name, deb_path)
+    except FetchError as e:
+        die("download failed: %s" % e)
     actual = sha256(deb_path)
     if actual != expected:
         die("checksum mismatch for %s: expected %s, got %s" % (deb_name, expected, actual))
-    log("Verified SHA-256 against the release checksum file ... ok")
+    log("Verified SHA-256 against the %s checksum file ... ok" % kind)
     return deb_path
 
 
@@ -206,10 +194,10 @@ def main():
     p.add_argument("--version", default="latest", help="release version to install (default: latest)")
     p.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repository owner/name")
     p.add_argument("--deb", help="install this local .deb instead of downloading")
-    p.add_argument("--from", dest="from_url", help="fetch the package from this URL (a Sigvid backend's /downloads) instead of GitHub")
+    p.add_argument("--from", dest="from_url", help="fetch SHA256SUMS and the package from a Sigvid backend's /downloads instead of GitHub")
     p.add_argument("--re-enroll", action="store_true", help="replace an existing enrollment on this host")
     p.add_argument("--allow-insecure-http", action="store_true", help="lab only: allow an http:// backend")
-    p.add_argument("--api-base", default=DEFAULT_API, help="release API base (default: GitHub); tests point this at a local server")
+    p.add_argument("--release-url", help="fetch SHA256SUMS and the package from this URL instead of the GitHub release (tests point this at a local server)")
     p.add_argument("--download-only", metavar="DIR", help="fetch and verify the package into DIR, then stop (no root needed)")
     p.add_argument("--component", default="host-agent", choices=sorted(COMPONENTS), help="which component to install (default: host-agent)")
     args = p.parse_args()
