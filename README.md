@@ -12,7 +12,7 @@ backend serves the installer itself the command fetches from the backend;
 otherwise it is:
 
 ```bash
-curl -fsSL https://github.com/norvidinc/sigvid-agentic-defense-v6-a-install/releases/latest/download/install.py | sudo python3 - --server https://YOUR-BACKEND --token enr_…
+curl -fsSL https://github.com/norvidinc/sigvid-agentic-defense-v6-alpha-install/releases/latest/download/install.py | sudo python3 - --server https://YOUR-BACKEND --token enr_…
 ```
 
 The installer

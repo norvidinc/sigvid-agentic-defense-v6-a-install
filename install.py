@@ -20,7 +20,7 @@ import tempfile
 import time
 import urllib.request
 
-DEFAULT_REPO = "norvidinc/sigvid-agentic-defense-v6-a-install"
+DEFAULT_REPO = "norvidinc/sigvid-agentic-defense-v6-alpha-install"
 DEFAULT_API = "https://api.github.com"
 CONFIG = "/etc/sigvid/agent.yaml"
 # Components a release may carry; the package name decides which asset to fetch.
